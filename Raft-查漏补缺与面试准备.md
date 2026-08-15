@@ -211,7 +211,7 @@ entries = []
 
 的 `AppendEntries`。
 
-Follower 本地维护随机化的选举计时器。如果在超时时间内没有收到合法 Leader 的心跳，也没有给其他候选者投票，它会：
+Follower 本地维护随机化的选举计时器。如果在一个选举超时窗口内既没有收到合法 Leader 的 AppendEntries，也没有向合法 Candidate 授票，它会：
 
 1. 增加 `currentTerm`。
 2. 从 Follower 变成 Candidate。
@@ -310,6 +310,8 @@ votedFor = null
 
 这使网络分区中的旧 Leader 在重新接触集群后自动退位。
 
+还有一个容易漏掉的规则：Candidate 收到 `term == currentTerm` 的合法 AppendEntries，说明本任期已经选出了 Leader，也应当退回 Follower。只有比较更大 term 才退位是不完整的。
+
 ### 4.6 PreVote 是什么
 
 PreVote 是常见工程扩展，不是理解基础 Raft 的前置条件。
@@ -353,10 +355,17 @@ prevLogIndex = nextIndex[Follower] - 1
 prevLogTerm  = Leader.log[prevLogIndex].term
 ```
 
-如果 `prevLogIndex` 已经被压缩进快照，则 term 来自：
+快照边界需要分三种情况：
 
 ```text
-snapshot.lastIncludedTerm
+prevLogIndex == snapshot.lastIncludedIndex
+    → prevLogTerm = snapshot.lastIncludedTerm
+
+prevLogIndex > snapshot.lastIncludedIndex
+    → 从 Leader 仍保留的日志中读取 term
+
+prevLogIndex < snapshot.lastIncludedIndex，且旧日志已被删除
+    → 无法构造该位置的 prevLogTerm，应改发 InstallSnapshot
 ```
 
 这两个字段表达：
@@ -401,14 +410,23 @@ Follower 不匹配就拒绝，Leader 回退 `nextIndex` 后重试。
 简化流程：
 
 1. 如果 RPC term 小于 `currentTerm`，拒绝。
-2. 如果 RPC term 更大，更新 term 并退回 Follower。
+2. 如果 RPC term 更大，更新 term 并退回 Follower；Candidate 收到同 term 的合法 AppendEntries 也退回 Follower。
 3. 检查本地是否存在 `prevLogIndex`。
 4. 检查该位置的 term 是否等于 `prevLogTerm`。
 5. 不匹配则拒绝。
 6. 匹配后，从 `entries[]` 的第一条冲突日志开始处理。
 7. 如果同一 index 的 term 不同，删除该位置及其后全部日志。
 8. 追加 Leader 发来的剩余日志。
-9. 根据 `leaderCommit` 推进自己的 `commitIndex`，但不能超过已确认与 Leader 匹配的日志范围。
+9. 仅当 `leaderCommit > commitIndex` 时推进提交水位：
+
+   ```text
+   commitIndex = min(
+       leaderCommit,
+       本次 RPC 已验证与 Leader 匹配的最高 index
+   )
+   ```
+
+   这样既保证 `commitIndex` 单调递增，也不会提交尚未验证匹配的本地后缀。
 
 ### 5.5 同一 index 的 term 相同怎么办
 
@@ -846,15 +864,16 @@ remoteTerm > currentTerm
 
 典型流程：
 
-1. Leader 记录当前 `commitIndex`，作为本次 `readIndex`。
-2. 与多数节点交换心跳，确认自己仍是 Leader。
-3. 等待：
+1. 新 Leader 先确保本任期至少有一条日志已经提交，通常是 no-op。否则它可能还不知道旧任期日志真正提交到了哪里。
+2. Leader 记录当前 `commitIndex`，作为本次 `readIndex`。
+3. 携带本次读专属的 context 与多数节点交换心跳，并等待当前任期的多数派响应，不能复用旧心跳 ACK。
+4. 等待：
 
    ```text
    lastApplied >= readIndex
    ```
 
-4. 从本地状态机读取。
+5. 从本地状态机读取。
 
 ReadIndex 不为每次读追加日志，但通常需要一次多数派确认。
 
@@ -908,8 +927,10 @@ log[]
 lastIncludedIndex
 lastIncludedTerm
 snapshot state
-configuration
+configurationAsOf(lastIncludedIndex)
 ```
+
+这里保存的是截至快照边界已经进入日志历史的最新配置，不能错误地打包快照边界之后的配置。
 
 ### 9.2 论文中的易失状态
 
@@ -958,7 +979,7 @@ Snapshot {
     stateMachineState
     lastIncludedIndex
     lastIncludedTerm
-    latestConfiguration
+    configurationAsOf(lastIncludedIndex)
 }
 ```
 
@@ -1033,13 +1054,15 @@ Snapshot 传输的是：
 
 ### 10.5 什么时候发送 InstallSnapshot
 
-当 Leader 为某个 Follower 回退 `nextIndex` 时，发现：
+当 Leader 为某个 Follower 回退 `nextIndex` 时，发现 Follower 需要的下一条日志已经不在 Leader 当前可用的日志范围内，就必须发送快照。
+
+如果实现已删除快照边界前的全部旧日志，常见判断表现为：
 
 ```text
 nextIndex[F] <= snapshot.lastIncludedIndex
 ```
 
-说明 Follower 需要的日志已经被 Leader 压缩删除。
+如果实现为了性能在快照之外又保留了一段旧日志，则应先继续使用这些日志；不能只看 `nextIndex <= lastIncludedIndex` 就机械发送快照。
 
 Leader 无法再用 AppendEntries 补齐，只能发送：
 
@@ -1145,23 +1168,28 @@ Follower 不会把自己的快照主动推给 Leader。Raft 的日志同步始�
 
 ## 十一、成员变更
 
-成员配置本身也属于共识状态，不能直接从旧配置一步切换到新配置。
+成员配置本身也属于共识状态，不能在没有安全过渡协议的情况下直接从旧配置切换到新配置。
 
 如果旧、新配置各自形成不相交的多数派，可能同时选出两个 Leader。
 
 经典做法是 Joint Consensus：
 
-1. 先提交联合配置 `C_old,new`。
-2. 联合阶段的决议同时需要旧配置多数派和新配置多数派。
-3. 再提交纯新配置 `C_new`。
+1. Leader 把联合配置 `C_old,new` 追加到日志。
+2. 节点一旦把该配置写入自己的日志，就立即使用“本地日志中的最新配置”参与后续选举和提交判断，不等待它先被提交。
+3. `C_old,new` 及联合阶段的其他日志，都必须同时获得旧配置多数派和新配置多数派。
+4. 联合配置提交后，Leader 再追加纯新配置 `C_new`。
+5. 节点收到 `C_new` 后同样立即按新配置工作，最终由新配置多数派提交它。
 
 部分工程实现使用一次只增加或删除一个投票节点的安全变更流程，并要求：
 
 - 变更串行执行；
-- 新节点先作为 Learner 追赶；
-- 前一次配置提交后才能继续下一次。
+- 任意时刻至多存在一条未提交配置；
+- 前一次配置提交后才能继续下一次；
+- Leader 先建立当前任期的已提交日志，再发起配置变化；
+- 节点对本地日志中的最新配置立即生效，而不是等配置提交；
+- 新节点通常先作为 Learner 追赶，再获得投票权，避免降低可用性。
 
-不要把“新增节点加入通信列表”等同于“立即获得投票权”。
+Learner 追赶主要解决可用性问题，不能替代配置变更协议本身的安全条件。不要把“新增节点加入通信列表”等同于“立即获得投票权”，也不要自行拼装未经证明的单节点变更流程。
 
 ---
 
@@ -1195,14 +1223,14 @@ Ceph 处理读热点的常见方式：
 
 这些机制不能把单个 PG 的写操作变成多个 Primary 并行提交。
 
-Ceph 的强一致来自：
+Ceph 在单个 RADOS 对象、当前 PG interval 内的一致性主要来自：
 
 - Primary 排序；
-- acting set 同步持久化；
+- 按当前可写 acting set 和 `min_size` 规则完成副本持久化；
 - PG peering 选出权威历史；
 - read lease 防止被隔离的旧 Primary 返回陈旧数据。
 
-它不是直接复用一个全局 Raft 日志。
+这不代表跨多个 RADOS 对象存在全局线性一致事务。它也不是直接复用一个全局 Raft 日志，Ceph 的写确认规则不能简单类比成 Raft 多数派提交。
 
 ### 12.2 DAOS 也不是所有数据都经过 Raft Leader
 
@@ -1212,7 +1240,7 @@ DAOS 中“Leader”至少有多种含义：
 - DTX Leader：协调某笔分布式事务；
 - 冗余组中的 Leader Replica：协调某组对象更新。
 
-普通对象 fetch 可以选择有效副本，不一定总去 DTX Leader。若非 Leader 副本遇到 prepared/committable DTX，无法安全判断最新版本，客户端会重试到 DTX Leader。
+普通对象 fetch 可以选择有效副本，不一定总去 DTX Leader。若非 Leader 副本遇到本地尚不能确定最终状态或可见性的 DTX，客户端会根据服务端结果刷新状态、重试，必要时转向 DTX Leader；不能把 `prepared`、`committable` 和 `committed` 当成同一种状态。
 
 DAOS 数据一致性主要依靠：
 
@@ -1327,7 +1355,7 @@ DAOS 官方明确描述的是分布式事务的可串行化，不能不加前提
 
 口述答案：
 
-> Follower 在随机选举超时内没有收到合法 Leader 的 AppendEntries 心跳，就增加 currentTerm、转为 Candidate、给自己投票并持久化 currentTerm 和 votedFor，然后并发发送 RequestVote。投票者要求候选者 term 不落后、本任期尚未投给其他人，并且候选者日志至少一样新，日志新旧先比 lastLogTerm，再比 lastLogIndex。候选者获得整个配置的多数票后成为 Leader。瓜分选票时，各 Candidate 在新的随机超时后进入更高任期重选；节点看到更高 term 会立即退回 Follower。
+> Follower 在一个选举超时窗口内既没有收到合法 Leader 的 AppendEntries，也没有向合法 Candidate 授票，就增加 currentTerm、转为 Candidate、给自己投票并持久化 currentTerm 和 votedFor，然后并发发送 RequestVote。投票者要求候选者 term 不落后、本任期尚未投给其他人，并且候选者日志至少一样新，日志新旧先比 lastLogTerm，再比 lastLogIndex。候选者获得整个配置的多数票后成为 Leader。瓜分选票时，各 Candidate 在新的随机超时后进入更高任期重选；节点看到更高 term，或者 Candidate 收到同 term 合法 Leader 的 AppendEntries，都会退回 Follower。
 
 ### 14.2 prevLogIndex/prevLogTerm 是什么
 
@@ -1369,13 +1397,13 @@ DAOS 官方明确描述的是分布式事务的可串行化，不能不加前提
 
 口述答案：
 
-> 只读本地 Leader 不够，因为被隔离的旧 Leader 可能不知道自己已失效。ReadIndex 方案先让 Leader 与多数派交换心跳确认领导权，记录安全 readIndex，再等待 lastApplied 不小于该位置后读取状态机。Lease Read 可以省掉每次多数派确认，但依赖时钟漂移和租约假设。
+> 只读本地 Leader 不够，因为被隔离的旧 Leader 可能不知道自己已失效。ReadIndex 要先确保 Leader 已提交一条当前任期日志，再记录 commitIndex，并携带本次读的唯一 context 与多数派交换心跳，确认当前任期领导权；最后等待 lastApplied 不小于 readIndex 后读取状态机。Lease Read 可以省掉每次多数派确认，但依赖时钟漂移和租约假设。
 
 ### 14.9 Follower 落后到日志已压缩怎么办
 
 口述答案：
 
-> 如果 Follower 的 nextIndex 已落到 Leader 快照覆盖范围内，Leader 已经没有缺失日志可发送，只能通过 InstallSnapshot 传输执行完该日志前缀后的完整状态机。Follower 原子安装快照，把 commitIndex 和 lastApplied 至少推进到 lastIncludedIndex，然后 Leader 从下一条恢复 AppendEntries。
+> 如果 Follower 需要的日志已不在 Leader 保留的日志范围内，Leader 只能通过 InstallSnapshot 传输执行完该日志前缀后的完整状态机。Follower 原子安装快照，把 commitIndex 和 lastApplied 至少推进到 lastIncludedIndex，然后 Leader 从下一条恢复 AppendEntries。
 
 ### 14.10 Snapshot 后缀如何处理
 
@@ -1404,6 +1432,8 @@ DAOS 官方明确描述的是分布式事务的可串行化，不能不加前提
 13. Follower 的 `log[1000].term` 与快照的 `lastIncludedTerm` 相同时，后缀能否保留？
 14. 本地创建 Snapshot 与 InstallSnapshot RPC 有什么区别？
 15. Ceph PG Primary 和 Raft Leader 为什么不能直接画等号？
+16. ReadIndex 为什么要求 Leader 先提交一条当前任期日志，并为本次读等待带唯一 context 的多数派响应？
+17. Joint Consensus 中，配置条目是在提交后生效，还是写入本地日志后立即生效？
 
 ## 十六、自测题答案
 
@@ -1422,6 +1452,8 @@ DAOS 官方明确描述的是分布式事务的可串行化，不能不加前提
 13. 可以保留，但保留不等于提交，后续冲突仍由 AppendEntries 截断。
 14. 所有节点都能本地创建快照压缩日志；InstallSnapshot 由 Leader 用来让落后 Follower 追赶。
 15. Ceph 是每 PG 一个 Primary，数据操作不经过一个全局 Raft 日志；两者的复制、故障恢复和一致性机制不同。
+16. 当前任期日志让 Leader确定自己掌握的安全提交水位；唯一 context 的当前任期多数派响应证明本次读发生时它仍是 Leader，旧 ACK 不能证明这一点。
+17. 节点把配置条目写入本地日志后就立即使用日志中的最新配置；Joint 阶段要求新旧配置各自多数，不能等条目提交后才切换 quorum 规则。
 
 ---
 
